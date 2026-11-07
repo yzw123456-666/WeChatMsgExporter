@@ -95,8 +95,10 @@ body{margin:0;background:#F5F5F5;font-family:""Segoe UI"",""Microsoft YaHei"",sa
             sb.Append("</div></div></div>");
         }
 
-        sb.Append("<div class=\"footer\">— END —</div></div><script>document.addEventListener('click',e=>{if(e.target.matches('img.pic')){window.open(e.target.src)}})</script>");
-        sb.Append("</div></body></html>");
+        sb.Append("<div class=\"footer\">— END —</div></div>");
+        sb.Append("<div id=\"lb\" style=\"display:none;position:fixed;inset:0;background:rgba(0,0,0,.86);z-index:99;align-items:center;justify-content:center;cursor:zoom-out\"><img id=\"lbi\" style=\"max-width:92vw;max-height:92vh;border-radius:6px;box-shadow:0 8px 40px rgba(0,0,0,.5)\"></div>");
+        sb.Append("<script>document.addEventListener('click',function(e){var lb=document.getElementById('lb');if(e.target&&e.target.matches('img.pic')){document.getElementById('lbi').src=e.target.src;lb.style.display='flex';}else if(e.target&&e.target.id==='lbi'||e.target&&e.target.id==='lb'){lb.style.display='none';}});</script>");
+        sb.Append("</body></html>");
 
         var file = Path.Combine(opt.OutDir, SafeFileName(session.DisplayName) + ".html");
         File.WriteAllText(file, sb.ToString(), new UTF8Encoding(false));
