@@ -241,6 +241,21 @@ public class MainForm : Form
         sidebarNav?.SetEnabled(Sidebar.IconId.Export, has);
     }
 
+    WxInstall DiscoverV4InsFromMemory(WxKeyFinder.ProcInfo proc, Action<string> log)
+    {
+        var roots = WxKeyFinder.DiscoverV4Roots(proc.Pid, log);
+        var best = roots.GroupBy(r => r.Root, StringComparer.OrdinalIgnoreCase)
+                        .OrderByDescending(g => g.Count()).Select(g => g.Key).FirstOrDefault();
+        if (best == null) return null;
+        var accs = WxDetect.AccountsUnder(best);
+        if (accs.Count == 0)
+            accs = roots.Where(r => r.Root.Equals(best, StringComparison.OrdinalIgnoreCase))
+                        .Select(r => r.WxId).Where(WxDetect.IsWxid).Distinct().ToList();
+        if (accs.Count == 0) return null;
+        log($"发现活跃数据目录: {best}");
+        return new WxInstall { Kind = "v4", DataRoot = best, Accounts = accs };
+    }
+
     void SetStatus(string s) => statusLabel.Text = s;
 
     // ---------- 自动识别 ----------
@@ -273,27 +288,63 @@ public class MainForm : Form
 
             log("正在查找微信数据目录...");
             var installs = WxDetect.DetectInstalls();
-            var ins = installs.FirstOrDefault(i => i.Kind == (isV4 ? "v4" : "v3"));
-            if (ins == null || ins.Accounts.Count == 0)
-            {
-                log("✗ 未找到微信数据目录（未找到账号文件夹）。");
-                log("若微信数据保存在自定义位置，请使用「手动导入」。");
-                return;
-            }
-            string wxid = ins.Accounts[0];
-            if (ins.Accounts.Count > 1)
-            {
-                var sel = SelectDialog.Pick(this, "选择微信账号", ins.Accounts.ToArray());
-                if (sel < 0) { log("已取消"); return; }
-                wxid = ins.Accounts[sel];
-            }
-            var wxDir = Path.Combine(ins.DataRoot, wxid);
-            log($"数据目录: {wxDir}");
+            foreach (var i in installs) log("  候选: " + i);
 
-            log("正在收集数据库文件...");
-            var dbs = isV4 ? WxDetect.FindV4Dbs(wxDir) : WxDetect.FindV3Dbs(wxDir);
-            if (dbs.Count == 0) { log("✗ 未找到 .db 数据库文件"); return; }
-            log($"  共 {dbs.Count} 个数据库");
+            List<(string name, string path)> dbs;
+            string wxDir;
+            string mediaWxid = "";
+            if (isV4)
+            {
+                // 合并所有候选根目录 × 账号的数据库；内存中的密钥只匹配活跃目录的库
+                dbs = new List<(string name, string path)>();
+                var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                string activeRoot = null, activeWxid = null;
+                var newest = DateTime.MinValue;
+                foreach (var iv in installs.Where(i => i.Kind == "v4"))
+                    foreach (var acc in iv.Accounts)
+                    {
+                        var dir = Path.Combine(iv.DataRoot, acc);
+                        var nw = WxDetect.NewestDbWrite(dir);
+                        log($"  候选: {dir}  最近写入 {(nw == DateTime.MinValue ? "-" : nw.ToString("yyyy-MM-dd HH:mm"))}");
+                        foreach (var d in WxDetect.FindV4Dbs(dir))
+                            if (seen.Add(d.path)) dbs.Add(d);
+                        if (nw > newest) { newest = nw; activeRoot = iv.DataRoot; activeWxid = acc; }
+                    }
+                if (dbs.Count == 0)
+                {
+                    log("候选目录中无数据库，正在从微信内存定位...");
+                    var insM = await Task.Run(() => DiscoverV4InsFromMemory(proc, log));
+                    if (insM != null)
+                        foreach (var acc in insM.Accounts)
+                            foreach (var d in WxDetect.FindV4Dbs(Path.Combine(insM.DataRoot, acc)))
+                                if (seen.Add(d.path)) dbs.Add(d);
+                }
+                if (dbs.Count == 0) { log("✗ 未找到 .db 数据库文件。请确认微信已登录后重试，或使用「手动导入」。"); return; }
+                wxDir = Path.Combine(activeRoot ?? "", activeWxid ?? "");
+                mediaWxid = activeWxid ?? "";
+                log($"活跃数据目录: {wxDir}");
+            }
+            else
+            {
+                var ins = installs.FirstOrDefault(i => i.Kind == "v3");
+                if (ins == null || ins.Accounts.Count == 0)
+                {
+                    log("✗ 未找到微信数据目录。");
+                    log("若微信数据保存在自定义位置，请使用「手动导入」直接选择该文件夹。");
+                    return;
+                }
+                string wxid = ins.Accounts[0];
+                if (ins.Accounts.Count > 1)
+                {
+                    var sel = SelectDialog.Pick(this, "选择微信账号", ins.Accounts.ToArray());
+                    if (sel < 0) { log("已取消"); return; }
+                    wxid = ins.Accounts[sel];
+                }
+                wxDir = Path.Combine(ins.DataRoot, wxid);
+                mediaWxid = wxid;
+                dbs = WxDetect.FindV3Dbs(wxDir).Select(d => d).ToList();
+            }
+            log($"共 {dbs.Count} 个数据库");
 
             // 读取首页用于验证
             var page1s = new Dictionary<string, byte[]>();
@@ -314,6 +365,26 @@ public class MainForm : Form
             if (!scan.Found)
             {
                 log("✗ " + (string.IsNullOrEmpty(scan.Detail) ? "未能提取密钥" : scan.Detail));
+                // 微信 4.1.13+ 加固了密钥存储（内存中不再保留密钥/盐值），当前开源方案均无法提取
+                if (isV4)
+                {
+                    Version v = null;
+                    try { v = new Version(proc.Version ?? ""); } catch { }
+                    if (v == null || v >= new Version(4, 1, 13))
+                    {
+                        log("");
+                        log("━━ 检测到微信 " + (proc.Version ?? "4.1.13+") + " ━━");
+                        log("微信 4.1.13 起对数据库密钥做了加固（内存中不再保留密钥，");
+                        log("改用系统 CNG 等方式持有），目前所有已知开源方案都无法提取，");
+                        log("开源社区正在攻坚中。");
+                        log("");
+                        log("替代方案：");
+                        log("  ① 手动导入其他工具（如旧版微信环境）解密出的数据库；");
+                        log("  ② 关注本项目更新，适配后可一键识别；");
+                        log("  ③ 微信 3.x / 4.0.x ~ 4.1.12.x 用户不受影响，可直接识别。");
+                        return;
+                    }
+                }
                 log("提示：保持微信前台并打开任意一个聊天窗口后重试，或使用「手动导入」输入密钥。");
                 return;
             }
@@ -322,7 +393,7 @@ public class MainForm : Form
             var ws = AppPaths.Workspace(isV4 ? "v4" : "v3");
             WxDetect.DecryptReport report;
             if (isV4 && scan.PerDbKeys.Count > 0 && string.IsNullOrEmpty(scan.KeyHex))
-                report = await Task.Run(() => WxDetect.DecryptAllV4(scan.PerDbKeys, ws, log));
+                report = await Task.Run(() => WxDetect.DecryptAllV4(scan.PerDbKeys, ws, log, null, scan.IvOff));
             else
                 report = await Task.Run(() => WxDetect.DecryptAll(dbs.Select(d => d.path), scan.KeyHex, ws, log));
 
@@ -333,7 +404,7 @@ public class MainForm : Form
             var lr = await Task.Run(() => WxStore.Load(report.Map.Values.ToArray(), wxDir));
             var st = lr.Store;
             foreach (var w in lr.Warnings.Take(5)) log("  警告: " + w);
-            var mi = WxStore.MediaIndex.Build(wxDir, wxid);
+            var mi = WxStore.MediaIndex.Build(wxDir, mediaWxid);
             var mc = new MediaCache(mi, AppPaths.Cache);
             await Task.Delay(50);
             BeginInvoke(() => BindStore(st, mc));

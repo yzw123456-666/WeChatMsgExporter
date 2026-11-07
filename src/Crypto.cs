@@ -46,12 +46,24 @@ public static class WxDbCrypto
 
     public static byte[] ReadPage1(string path)
     {
-        using var fs = File.OpenRead(path);
+        using var fs = OpenReadShared(path);
         var buf = new byte[PageSz];
         int n = fs.Read(buf, 0, PageSz);
         if (n < PageSz) throw new IOException("文件过小: " + path);
         return buf;
     }
+
+    /// <summary>共享读取（微信以独占方式持有数据库文件句柄）</summary>
+    public static byte[] ReadAllShared(string path)
+    {
+        using var fs = OpenReadShared(path);
+        using var ms = new MemoryStream((int)fs.Length);
+        fs.CopyTo(ms);
+        return ms.ToArray();
+    }
+
+    public static FileStream OpenReadShared(string path) =>
+        new(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
 
     // ---------- v3 验证 ----------
 
@@ -74,17 +86,22 @@ public static class WxDbCrypto
 
     // ---------- v4 验证 ----------
 
-    public static bool VerifyV4(byte[] encKey, byte[] page1)
+    public static bool VerifyV4(byte[] encKey, byte[] page1) => VerifyV4Auto(encKey, page1, 4016);
+
+    /// <summary>验证（保留段布局可变：IV 位于 ivOff，HMAC 紧随其后占 64 字节）</summary>
+    public static bool VerifyV4Auto(byte[] encKey, byte[] page1, int ivOff)
     {
         try
         {
+            int ctLen = ivOff - 16;                       // 页1密文长度
+            if (ctLen % 16 != 0 || ivOff + 16 + 64 > PageSz) return false;
             var salt = page1.AsSpan(0, 16).ToArray();
             var macSalt = Xor3A(salt);
             var macKey = Rfc2898DeriveBytes.Pbkdf2(encKey, macSalt, 2, HashAlgorithmName.SHA512, 32);
             using var h = new HMACSHA512(macKey);
-            h.TransformBlock(page1, 16, 4016, null, 0);       // [16:4032] 密文+IV
+            h.TransformBlock(page1, 16, ctLen + 16, null, 0);   // 密文+IV
             h.TransformFinalBlock(new byte[] { 1, 0, 0, 0 }, 0, 4);
-            var want = page1.AsSpan(4032, 64).ToArray();      // [4032:4096]
+            var want = page1.AsSpan(ivOff + 16, 64).ToArray();
             return h.Hash.AsSpan().SequenceEqual(want);
         }
         catch { return false; }
@@ -108,7 +125,7 @@ public static class WxDbCrypto
 
     public static bool DecryptV3(byte[] key, string dbPath, string outPath, Action<int, int> progress = null)
     {
-        var blist = File.ReadAllBytes(dbPath);
+        var blist = WxDbCrypto.ReadAllShared(dbPath);
         if (blist.Length < PageSz) return false;
         var salt = blist.AsSpan(0, 16).ToArray();
         var aesKey = Rfc2898DeriveBytes.Pbkdf2(key, salt, 64000, HashAlgorithmName.SHA1, 32);
@@ -146,9 +163,33 @@ public static class WxDbCrypto
     // ---------- v4 解密（完整文件） ----------
 
     public static bool DecryptV4(byte[] encKey, string dbPath, string outPath, Action<int, int> progress = null)
+        => DecryptV4Auto(encKey, dbPath, outPath, 4016, progress);
+
+    /// <summary>解密（自动探测保留段布局：IV 位置 + 页头第 20 字节的保留字节数）</summary>
+    public static bool DecryptV4Auto(byte[] encKey, string dbPath, string outPath, int hintIvOff, Action<int, int> progress = null)
     {
-        var blist = File.ReadAllBytes(dbPath);
+        var blist = ReadAllShared(dbPath);
         if (blist.Length < PageSz) return false;
+
+        int[] ivOffs = { hintIvOff, 4016, 4048, 4032, 4080, 4000, 3984 };
+        int ivOff = -1, reserve = 0;
+        foreach (var off in ivOffs)
+        {
+            if (off < 16 || off + 80 > PageSz || (off - 16) % 16 != 0) continue;
+            int R = PageSz - off;
+            try
+            {
+                var iv = blist.AsSpan(off, 16).ToArray();
+                using var aes0 = Aes.Create();
+                aes0.Key = encKey; aes0.Mode = CipherMode.CBC; aes0.Padding = PaddingMode.None;
+                var dec = aes0.DecryptCbc(blist.AsSpan(16, off - 16).ToArray(), iv, PaddingMode.None);
+                // sqlite 头（自明文16字节起）: dec[2]=写版本1, dec[3]=读版本1, dec[4]=保留数R, dec[5..7]=64/32/32
+                if (dec[2] == 1 && dec[3] == 1 && dec[4] == R && dec[5] == 64 && dec[6] == 32 && dec[7] == 32)
+                { ivOff = off; reserve = R; break; }
+            }
+            catch { }
+        }
+        if (ivOff < 0) return false;
 
         using var fs = new FileStream(outPath, FileMode.Create, FileAccess.Write);
         using var aes = Aes.Create();
@@ -159,26 +200,18 @@ public static class WxDbCrypto
         {
             int off = i * PageSz;
             int len = Math.Min(PageSz, blist.Length - off);
-            if (len < PageSz)
-            {
-                var pad = new byte[PageSz];
-                Array.Copy(blist, off, pad, 0, len);
-                WritePage(fs, aes, pad, i == 0);
-            }
-            else WritePage(fs, aes, blist.AsSpan(off, PageSz).ToArray(), i == 0);
+            var page = new byte[PageSz];
+            Array.Copy(blist, off, page, 0, len);
+
+            var iv = page.AsSpan(ivOff, 16).ToArray();
+            int ctLen = ivOff - (i == 0 ? 16 : 0);
+            if (i == 0) fs.Write(SqliteHdrBytes, 0, 16);
+            var dec = aes.DecryptCbc(page.AsSpan(i == 0 ? 16 : 0, ctLen).ToArray(), iv, PaddingMode.None);
+            fs.Write(dec, 0, dec.Length);
+            fs.Write(new byte[reserve], 0, reserve);   // 保留段置零
             if (progress != null && (i & 0x3F) == 0) progress(i, pages);
         }
         return true;
-    }
-
-    static void WritePage(FileStream fs, Aes aes, byte[] page, bool first)
-    {
-        var iv = page.AsSpan(4016, 16).ToArray();
-        if (first) fs.Write(SqliteHdrBytes, 0, 16);
-        var ct = page.AsSpan(first ? 16 : 0, first ? 4000 : 4016).ToArray();
-        var dec = aes.DecryptCbc(ct, iv, PaddingMode.None);
-        fs.Write(dec, 0, dec.Length);
-        fs.Write(new byte[80], 0, 80);   // 保留段置零，usable_size=4016
     }
 
     // ---------- 加密（仅用于自测往返验证） ----------
@@ -300,7 +333,7 @@ public static class DatImage
     {
         try
         {
-            var data = File.ReadAllBytes(datPath);
+            var data = WxDbCrypto.ReadAllShared(datPath);
             if (data.Length < 16) return (null, null);
 
             // V1 / V2

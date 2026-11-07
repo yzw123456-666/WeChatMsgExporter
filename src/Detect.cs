@@ -31,21 +31,84 @@ public static class WxDetect
             list.Add(ins);
         }
 
-        // v4: Documents\xwechat_files
-        string v4Root = ResolveV4Root();
-        if (!string.IsNullOrEmpty(v4Root))
+        // v4: Documents\xwechat_files + 全盘浅扫（可能存在多个候选根目录，全部返回）
+        var v4Roots = new List<string>();
+        var r0 = ResolveV4Root();
+        if (!string.IsNullOrEmpty(r0)) v4Roots.Add(r0);
+        foreach (var r in FindV4RootsByDriveScan())
+            if (!v4Roots.Contains(r, StringComparer.OrdinalIgnoreCase)) v4Roots.Add(r);
+        foreach (var v4Root in v4Roots)
         {
             var ins = new WxInstall { Kind = "v4", DataRoot = v4Root };
-            ins.Accounts = SafeDirs(v4Root).Where(d => IsWxid(Path.GetFileName(d))).Select(Path.GetFileName).ToList();
+            ins.Accounts = AccountsUnder(v4Root);
             ins.ExePath = FindV4Exe();
-            list.Add(ins);
+            if (ins.Accounts.Count > 0) list.Add(ins);
         }
         return list;
+    }
+
+    /// <summary>全盘浅层搜索所有 xwechat_files（自定义数据目录兜底）</summary>
+    public static List<string> FindV4RootsByDriveScan()
+    {
+        var found = new List<string>();
+        try
+        {
+            foreach (var drive in DriveInfo.GetDrives())
+            {
+                if (drive.DriveType != DriveType.Fixed || !drive.IsReady) continue;
+                string root = drive.Name;
+                var c0 = Path.Combine(root, "xwechat_files");
+                if (Directory.Exists(c0)) found.Add(c0);
+                foreach (var d in SafeDirs(root))
+                {
+                    var c1 = Path.Combine(d, "xwechat_files");
+                    if (Directory.Exists(c1) && !found.Contains(c1, StringComparer.OrdinalIgnoreCase)) found.Add(c1);
+                    foreach (var d2 in SafeDirs(d))
+                    {
+                        var c2 = Path.Combine(d2, "xwechat_files");
+                        if (Directory.Exists(c2) && !found.Contains(c2, StringComparer.OrdinalIgnoreCase)) found.Add(c2);
+                    }
+                }
+            }
+        }
+        catch { }
+        return found;
     }
 
     static List<string> SafeDirs(string dir)
     {
         try { return Directory.GetDirectories(dir).ToList(); } catch { return new(); }
+    }
+
+    /// <summary>目录下所有形如 wxid 的账号文件夹</summary>
+    public static List<string> AccountsUnder(string root)
+    {
+        var byDir = SafeDirs(root).Where(d => IsWxid(Path.GetFileName(d))).Select(Path.GetFileName).ToList();
+        // 按内容过滤：真账号目录必有 db_storage 或 msg 子目录（排除 all_users 等系统目录）
+        var byContent = SafeDirs(root)
+            .Where(d => Directory.Exists(Path.Combine(d, "db_storage")) || Directory.Exists(Path.Combine(d, "msg")))
+            .Select(Path.GetFileName).ToList();
+        var final = byDir.Count > 0 ? byDir.Intersect(byContent).ToList() : byContent;
+        return final.Count > 0 ? final : byContent;
+    }
+
+    /// <summary>数据目录里最新的数据库写入时间（判断目录是否是当前活跃的）</summary>
+    public static DateTime NewestDbWrite(string wxDir)
+    {
+        var dt = DateTime.MinValue;
+        try
+        {
+            var storage = Path.Combine(wxDir, "db_storage");
+            if (Directory.Exists(storage))
+            {
+                foreach (var f in Directory.EnumerateFiles(storage, "*.db*", SearchOption.AllDirectories))
+                {
+                    try { var t = File.GetLastWriteTime(f); if (t > dt) dt = t; } catch { }
+                }
+            }
+        }
+        catch { }
+        return dt;
     }
 
     public static bool IsWxid(string s)
@@ -296,7 +359,7 @@ public static class WxDetect
 
     /// <summary>v4 每库独立密钥解密</summary>
     public static DecryptReport DecryptAllV4(Dictionary<string, string> perDbKeys, string outDir,
-        Action<string> log = null, Action<int, int> progress = null)
+        Action<string> log = null, Action<int, int> progress = null, int ivOffHint = 4016)
     {
         var report = new DecryptReport();
         Directory.CreateDirectory(outDir);
@@ -310,7 +373,7 @@ public static class WxDetect
             {
                 var outPath = Path.Combine(outDir, outNames[kv.Key]);
                 var key = Convert.FromHexString(kv.Value.Replace(" ", ""));
-                if (WxDbCrypto.DecryptV4(key, kv.Key, outPath))
+                if (WxDbCrypto.DecryptV4Auto(key, kv.Key, outPath, ivOffHint))
                 {
                     report.Ok.Add(kv.Key); report.Map[kv.Key] = outPath;
                     log?.Invoke($"[v4 ] {Path.GetFileName(kv.Key)}");
