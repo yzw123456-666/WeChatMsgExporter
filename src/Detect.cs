@@ -301,7 +301,7 @@ public static class WxDetect
 
     /// <summary>用给定密钥批量解密到工作目录。keyHex 为空时假设数据库已明文（复制）。</summary>
     public static DecryptReport DecryptAll(IEnumerable<string> dbPaths, string keyHex, string outDir,
-        Action<string> log = null, Action<int, int> progress = null)
+        Action<string> log = null, Action<int, int> progress = null, bool passwordMode = false)
     {
         var report = new DecryptReport();
         Directory.CreateDirectory(outDir);
@@ -328,6 +328,18 @@ public static class WxDetect
 
                 var key = Convert.FromHexString(keyHex.Replace(" ", ""));
                 bool ok;
+                if (passwordMode)
+                {
+                    // 微信 4.1.13+/4.2：password 经 PBKDF2-SHA512(256000 轮, 盐=文件头16字节) 派生 enc_key
+                    var saltDb = WxDbCrypto.ReadPage1(db).AsSpan(0, 16).ToArray();
+                    var encKey = System.Security.Cryptography.Rfc2898DeriveBytes.Pbkdf2(
+                        key, saltDb, 256000, System.Security.Cryptography.HashAlgorithmName.SHA512, 32);
+                    ok = WxDbCrypto.DecryptV4(encKey, db, outPath);
+                    if (ok) log?.Invoke($"[v4P] {Path.GetFileName(db)}（password 派生）");
+                    else { report.Failed.Add(db); log?.Invoke($"[失败] {Path.GetFileName(db)}（password 不匹配）"); continue; }
+                    report.Ok.Add(db); report.Map[db] = outPath;
+                    continue;
+                }
                 if (WxDbCrypto.VerifyV3(key, WxDbCrypto.ReadPage1(db)))
                 {
                     ok = WxDbCrypto.DecryptV3(key, db, outPath);

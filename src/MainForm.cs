@@ -418,7 +418,7 @@ public class MainForm : Form
     void ShowImportDialog() => new ImportDialog(this).ShowDialog(this);
 
     /// <summary>导入管线：folder=数据库目录或文件；keyHex 可空（已解密/自动）</summary>
-    public async Task ImportFromAsync(string folder, string keyHex, LogDialog dlg)
+    public async Task ImportFromAsync(string folder, string keyHex, LogDialog dlg, bool passwordMode = false)
     {
         Action<string> log = s => dlg?.Log(s);
         try
@@ -443,7 +443,7 @@ public class MainForm : Form
             else
             {
                 log("正在验证密钥并解密...");
-                report = await Task.Run(() => WxDetect.DecryptAll(dbs, keyHex.Replace(" ", ""), AppPaths.Workspace("manual"), log));
+                report = await Task.Run(() => WxDetect.DecryptAll(dbs, keyHex.Replace(" ", ""), AppPaths.Workspace("manual"), log, null, passwordMode));
             }
             log($"  成功 {report.Ok.Count} 个，失败 {report.Failed.Count} 个");
             if (report.Ok.Count == 0)
@@ -670,7 +670,7 @@ public class ImportDialog : Form
 {
     readonly MainForm main;
     TextBox txtFolder, txtKey;
-    CheckBox chkPlain;
+    CheckBox chkPlain, chkPwd42;
 
     public ImportDialog(MainForm owner)
     {
@@ -693,6 +693,7 @@ public class ImportDialog : Form
 
         chkPlain = new CheckBox { Text = "数据库已解密（无需密钥）", Location = new Point(18, 140), AutoSize = true };
         chkPlain.CheckedChanged += (s, e) => txtKey.Enabled = !chkPlain.Checked;
+        chkPwd42 = new CheckBox { Text = "微信 4.2 password 模式（密钥来自社区 Frida 工具时勾选）", Location = new Point(230, 140), AutoSize = true, Width = 360 };
 
         var hint = new Label
         {
@@ -723,9 +724,10 @@ public class ImportDialog : Form
                 if (r != DialogResult.Yes) return;
             }
             var key = chkPlain.Checked ? "" : txtKey.Text;
+            bool pwdMode = chkPwd42.Checked && !chkPlain.Checked;
             Hide();
             using var dlg = new LogDialog("导入数据");
-            var t = dlg.RunAsync(log => main.ImportFromAsync(txtFolder.Text, key, dlg));
+            var t = dlg.RunAsync(log => main.ImportFromAsync(txtFolder.Text, key, dlg, pwdMode));
             dlg.ShowDialog(this);
             await t;
             Close();

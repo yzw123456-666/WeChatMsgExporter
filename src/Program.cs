@@ -21,6 +21,31 @@ internal static class Program
             }
         }
 
+        // cipher 配置结构指针追踪探针: WeChatMsgExporter.exe --probe4
+        if (args.Contains("--probe4"))
+        {
+            Console.WriteLine("[t0] probe4 启动"); Console.Out.Flush();
+            var procs = WxKeyFinder.FindWeChatProcesses();
+            Console.WriteLine($"[t1] procs={procs.Count}"); Console.Out.Flush();
+            var proc = procs.FirstOrDefault();
+            if (proc == null) { Console.WriteLine("无微信进程"); return 1; }
+            Console.WriteLine($"[t2] PID={proc.Pid}"); Console.Out.Flush();
+            var dbs = new List<(string saltHex, byte[] page1)>();
+            foreach (var ins in WxDetect.DetectInstalls().Where(i => i.Kind == "v4"))
+                foreach (var acc in ins.Accounts)
+                    foreach (var (name, path) in WxDetect.FindV4Dbs(Path.Combine(ins.DataRoot, acc)))
+                        try
+                        {
+                            if (new FileInfo(path).Length < 4096) continue;
+                            var p1 = WxDbCrypto.ReadPage1(path);
+                            dbs.Add((Convert.ToHexString(p1, 0, 16), p1));
+                        }
+                        catch { }
+            Console.WriteLine($"[t3] 采集 {dbs.Count} 个库"); Console.Out.Flush();
+            Probe4.Run(proc.Pid, dbs);
+            return 0;
+        }
+
         // 内存探针模式: WeChatMsgExporter.exe --probe
         if (args.Contains("--probe"))
         {
@@ -49,6 +74,30 @@ internal static class Program
             return 0;
         }
 
+        // cipher 配置结构精确探针: WeChatMsgExporter.exe --probe3
+        if (args.Contains("--probe3"))
+        {
+            try { Console.OutputEncoding = System.Text.Encoding.UTF8; } catch { }
+            var procs = WxKeyFinder.FindWeChatProcesses();
+            var proc = procs.FirstOrDefault();
+            if (proc == null) { Console.WriteLine("无微信进程"); return 1; }
+            Console.WriteLine($"PID={proc.Pid}");
+            var dbs = new List<(string saltHex, byte[] page1)>();
+            foreach (var ins in WxDetect.DetectInstalls().Where(i => i.Kind == "v4"))
+                foreach (var acc in ins.Accounts)
+                    foreach (var (name, path) in WxDetect.FindV4Dbs(Path.Combine(ins.DataRoot, acc)))
+                        try
+                        {
+                            if (new FileInfo(path).Length < 4096) continue;
+                            var p1 = WxDbCrypto.ReadPage1(path);
+                            dbs.Add((Convert.ToHexString(p1, 0, 16), p1));
+                        }
+                        catch { }
+            Console.WriteLine($"采集 {dbs.Count} 个库");
+            Probe3.Run(proc.Pid, dbs);
+            return 0;
+        }
+
         // codec 配置结构探针: WeChatMsgExporter.exe --probe2
         if (args.Contains("--probe2"))
         {
@@ -67,6 +116,7 @@ internal static class Program
             try { Console.OutputEncoding = System.Text.Encoding.UTF8; } catch { }
             return ConsoleAutoDetect();
         }
+
 
         // 示例导出模式: WeChatMsgExporter.exe --demo-export <输出目录>
         if (args.Length >= 2 && args[0] == "--demo-export")
